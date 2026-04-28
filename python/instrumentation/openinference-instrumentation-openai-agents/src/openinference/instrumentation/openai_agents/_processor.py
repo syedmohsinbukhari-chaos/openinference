@@ -65,6 +65,9 @@ from openinference.semconv.trace import (
 
 logger = logging.getLogger(__name__)
 
+_GCP_MAX_ATTR_BYTES = 256
+_GCP_MAX_ATTRS = 32
+
 
 class OpenInferenceTracingProcessor(TracingProcessor):
     _MAX_HANDOFFS_IN_FLIGHT = 1000
@@ -142,35 +145,37 @@ class OpenInferenceTracingProcessor(TracingProcessor):
             detach(token)  # type: ignore[arg-type]
         if not (otel_span := self._otel_spans.pop(span.span_id, None)):
             return
-        otel_span.update_name(_get_span_name(span))
+        span_name = _get_span_name(span)
+        otel_span.update_name(span_name)
         # flatten_attributes: dict[str, AttributeValue] = dict(_flatten(span.export()))
         # otel_span.set_attributes(flatten_attributes)
+        writer = _GCPSpanWriter(otel_span, self._tracer, span_name)
         data = span.span_data
         if isinstance(data, ResponseSpanData):
             if hasattr(data, "response") and isinstance(response := data.response, Response):
-                otel_span.set_attribute(OUTPUT_MIME_TYPE, JSON)
-                otel_span.set_attribute(OUTPUT_VALUE, response.model_dump_json())
+                writer.set_attribute(OUTPUT_MIME_TYPE, JSON)
+                writer.set_attribute(OUTPUT_VALUE, response.model_dump_json())
                 for k, v in _get_attributes_from_response(response):
-                    otel_span.set_attribute(k, v)
+                    writer.set_attribute(k, v)
             if hasattr(data, "input") and (input := data.input):
                 if isinstance(input, str):
-                    otel_span.set_attribute(INPUT_VALUE, input)
+                    writer.set_attribute(INPUT_VALUE, input)
                 elif isinstance(input, list):
-                    otel_span.set_attribute(INPUT_MIME_TYPE, JSON)
-                    otel_span.set_attribute(INPUT_VALUE, safe_json_dumps(input))
+                    writer.set_attribute(INPUT_MIME_TYPE, JSON)
+                    writer.set_attribute(INPUT_VALUE, safe_json_dumps(input))
                     for k, v in _get_attributes_from_input(input):
-                        otel_span.set_attribute(k, v)
+                        writer.set_attribute(k, v)
                 elif TYPE_CHECKING:
                     assert_never(input)
         elif isinstance(data, GenerationSpanData):
             for k, v in _get_attributes_from_generation_span_data(data):
-                otel_span.set_attribute(k, v)
+                writer.set_attribute(k, v)
         elif isinstance(data, FunctionSpanData):
             for k, v in _get_attributes_from_function_span_data(data):
-                otel_span.set_attribute(k, v)
+                writer.set_attribute(k, v)
         elif isinstance(data, MCPListToolsSpanData):
             for k, v in _get_attributes_from_mcp_list_tool_span_data(data):
-                otel_span.set_attribute(k, v)
+                writer.set_attribute(k, v)
         elif isinstance(data, HandoffSpanData):
             # Set this dict to find the parent node when the agent span starts
             if data.to_agent and data.from_agent:
@@ -180,11 +185,11 @@ class OpenInferenceTracingProcessor(TracingProcessor):
                 while len(self._reverse_handoffs_dict) > self._MAX_HANDOFFS_IN_FLIGHT:
                     self._reverse_handoffs_dict.popitem(last=False)
         elif isinstance(data, AgentSpanData):
-            otel_span.set_attribute(GRAPH_NODE_ID, data.name)
+            writer.set_attribute(GRAPH_NODE_ID, data.name)
             # Lookup the parent node if exists
             key = f"{data.name}:{span.trace_id}"
             if parent_node := self._reverse_handoffs_dict.pop(key, None):
-                otel_span.set_attribute(GRAPH_NODE_PARENT_ID, parent_node)
+                writer.set_attribute(GRAPH_NODE_PARENT_ID, parent_node)
 
         end_time: Optional[int] = None
         if span.ended_at:
@@ -194,6 +199,7 @@ class OpenInferenceTracingProcessor(TracingProcessor):
                 pass
         otel_span.set_status(status=_get_span_status(span))
         otel_span.end(end_time)
+        writer.end_overflow_spans()
 
     def force_flush(self) -> None:
         """Forces an immediate flush of all queued spans/traces."""
@@ -204,6 +210,44 @@ class OpenInferenceTracingProcessor(TracingProcessor):
         """Called when the application stops."""
         # TODO
         pass
+
+
+class _GCPSpanWriter:
+    """Writes span attributes while respecting GCP Cloud Trace limits.
+
+    Long string values are split across numbered keys (key_1, key_2, …).
+    If the 32-attribute cap is reached, a child overflow span is created to hold the rest.
+    """
+
+    def __init__(self, span: OtelSpan, tracer: Tracer, span_name: str) -> None:
+        self._tracer = tracer
+        self._base_name = span_name
+        self._span = span
+        self._count = len(getattr(span, "attributes", None) or {})
+        self._overflow_idx = 0
+        self._overflow_spans: list[OtelSpan] = []
+
+    def set_attribute(self, key: str, value: AttributeValue) -> None:
+        for k, v in _split_attribute(key, value):
+            if self._count >= _GCP_MAX_ATTRS:
+                self._next_overflow()
+            self._span.set_attribute(k, v)
+            self._count += 1
+
+    def _next_overflow(self) -> None:
+        self._overflow_idx += 1
+        ctx = set_span_in_context(self._span)
+        self._span = self._tracer.start_span(
+            f"{self._base_name} [overflow {self._overflow_idx}]",
+            context=ctx,
+        )
+        self._overflow_spans.append(self._span)
+        self._count = 0
+
+    def end_overflow_spans(self) -> None:
+        for s in self._overflow_spans:
+            s.set_status(Status(StatusCode.OK))
+            s.end()
 
 
 def _as_utc_nano(dt: datetime) -> int:
@@ -541,6 +585,46 @@ def _convert_to_primitive(value: Any) -> Union[bool, str, bytes, int, float]:
     return str(value)
 
 
+def _utf8_chunks(s: str) -> list[str]:
+    """Split s into UTF-8-safe chunks of at most _GCP_MAX_ATTR_BYTES bytes each."""
+    encoded = s.encode("utf-8")
+    if len(encoded) <= _GCP_MAX_ATTR_BYTES:
+        return [s]
+    chunks: list[str] = []
+    pos = 0
+    while pos < len(encoded):
+        raw = encoded[pos : pos + _GCP_MAX_ATTR_BYTES]
+        chunk = raw.decode("utf-8", errors="ignore")
+        if not chunk:
+            pos += 1
+            continue
+        chunks.append(chunk)
+        pos += len(chunk.encode("utf-8"))
+    return chunks
+
+
+def _split_attribute(
+    key: str, value: AttributeValue
+) -> list[tuple[str, AttributeValue]]:
+    """Return (key, value) pairs for a single attribute, splitting long strings.
+
+    INPUT_VALUE and OUTPUT_VALUE are bulk JSON dumps — truncated to avoid
+    attribute explosion. All other long strings are chunked into key_1, key_2, …
+    so no content is lost.
+    """
+    if not isinstance(value, str):
+        return [(key, value)]
+    if key in (INPUT_VALUE, OUTPUT_VALUE):
+        encoded = value.encode("utf-8")
+        if len(encoded) > _GCP_MAX_ATTR_BYTES:
+            value = encoded[:_GCP_MAX_ATTR_BYTES].decode("utf-8", errors="ignore")
+        return [(key, value)]
+    chunks = _utf8_chunks(value)
+    if len(chunks) == 1:
+        return [(key, value)]
+    return [(f"{key}_{i}", chunk) for i, chunk in enumerate(chunks, 1)]
+
+
 def _get_attributes_from_function_span_data(
     obj: FunctionSpanData,
 ) -> Iterator[tuple[str, AttributeValue]]:
@@ -584,19 +668,19 @@ def _get_attributes_from_message_content_list(
 
 
 def _get_attributes_from_response(obj: Response) -> Iterator[tuple[str, AttributeValue]]:
-    yield from _get_attributes_from_tools(obj.tools)
-    yield from _get_attributes_from_usage(obj.usage)
-    yield from _get_attributes_from_response_output(obj.output)
-    if isinstance(obj.instructions, str):
-        yield from _get_attributes_from_response_instruction(obj.instructions)
-    else:
-        pass  # TODO: handle list instructions
     yield LLM_MODEL_NAME, obj.model
     param = obj.model_dump(
         exclude_none=True,
         exclude={"object", "tools", "usage", "output", "error", "status"},
     )
     yield LLM_INVOCATION_PARAMETERS, safe_json_dumps(param)
+    yield from _get_attributes_from_usage(obj.usage)
+    if isinstance(obj.instructions, str):
+        yield from _get_attributes_from_response_instruction(obj.instructions)
+    else:
+        pass  # TODO: handle list instructions
+    yield from _get_attributes_from_tools(obj.tools)
+    yield from _get_attributes_from_response_output(obj.output)
 
 
 def _get_attributes_from_tools(

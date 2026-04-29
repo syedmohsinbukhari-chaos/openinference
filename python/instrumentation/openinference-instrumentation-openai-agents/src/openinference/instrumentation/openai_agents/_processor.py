@@ -671,7 +671,11 @@ def _get_attributes_from_response(obj: Response) -> Iterator[tuple[str, Attribut
     yield LLM_MODEL_NAME, obj.model
     param = obj.model_dump(
         exclude_none=True,
-        exclude={"object", "tools", "usage", "output", "error", "status"},
+        exclude={
+            "object", "tools", "usage", "output", "error", "status",
+            # Not model params — captured elsewhere or not useful in traces
+            "id", "created_at", "incomplete_details", "input", "instructions", "text",
+        },
     )
     yield LLM_INVOCATION_PARAMETERS, safe_json_dumps(param)
     yield from _get_attributes_from_usage(obj.usage)

@@ -694,20 +694,7 @@ def _get_attributes_from_tools(
         return
     for i, tool in enumerate(tools):
         if isinstance(tool, FunctionTool):
-            yield (
-                f"{LLM_TOOLS}.{i}.{TOOL_JSON_SCHEMA}",
-                safe_json_dumps(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                            "strict": tool.strict,
-                        },
-                    }
-                ),
-            )
+            yield f"{LLM_TOOLS}.{i}.{TOOL_NAME}", tool.name
         else:
             pass
 
